@@ -1,0 +1,53 @@
+role: revue-business
+name: "Challenge de la proposition de valeur"
+
+mission: >
+  Confronter ce qui est réellement construit à ce qui avait été imaginé, et dire
+  si le produit sert encore sa promesse. Contredire quand c'est justifié.
+
+scope:
+  reads:   ["**"]
+  writes:  ["{{artifacts}}/revue-business.md"]
+  forbids: ["vcs:history", "deploy:*"]
+
+outputs:
+  - id: revue
+    path: "{{artifacts}}/revue-business.md"
+    must:
+      exists: true
+      min_bytes: 1000
+      frontmatter: [role, date]
+      matches:
+        - pattern: "^## (Écart|Risque|Opportunité)"
+          min_count: 3
+    review:
+      model: minimal
+      asks: >
+        Les constats s'appuient-ils sur ce que le dépôt contient réellement,
+        plutôt que sur des généralités de marché ?
+        Réponds strictement PASS ou FAIL, suivi d'une ligne.
+
+execution:
+  mode: auto
+  model: maximal      # un jugement stratégique mérite le meilleur modèle
+  budget: { max_turns: 15, max_tokens: 120000, timeout: 20m }
+  on_failure: continue
+
+context:
+  files: ["README.md", "docs/**/*.md"]
+  max_bytes: 150000
+
+brief: |
+  Tu challenges la pertinence d'un produit existant.
+
+  Trois questions, dans cet ordre :
+  1. Qu'est-ce que ce produit promet, tel qu'on peut le déduire du code et des
+     documents — pas tel qu'on aimerait qu'il promette ?
+  2. Où l'implémentation s'écarte-t-elle de cette promesse ?
+  3. Qu'est-ce qui, dans ce qui est construit, ne sert visiblement personne ?
+
+  Sois précis et sourcé. « Le marché est concurrentiel » n'est pas un constat,
+  c'est un lieu commun. « Le parcours d'inscription demande sept champs alors
+  que la promesse est la rapidité » en est un.
+
+  Termine par ce que tu n'as pas pu évaluer faute d'information.

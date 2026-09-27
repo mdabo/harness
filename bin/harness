@@ -1,0 +1,247 @@
+#!/usr/bin/env node
+import path from 'path';
+import fs from 'fs';
+import { chargerDispositif } from '../lib/roles.mjs';
+import { decider, vagues } from '../lib/decide.mjs';
+import { verifierRole } from '../lib/verify.mjs';
+import { ordre, prochaineVague } from '../lib/emit.mjs';
+import { lireQuestions } from '../lib/questions.mjs';
+import { journal } from '../lib/journal.mjs';
+import { calculerDisposition, dessiner, appliquer, tmuxPresent } from '../lib/tmux.mjs';
+
+const G = '\x1b[32m', R = '\x1b[31m', J = '\x1b[33m', D = '\x1b[2m', B = '\x1b[1m', Z = '\x1b[0m';
+const projet = process.env.HARNESS_PROJECT || process.cwd();
+
+function aide() {
+  console.log(`
+${B}harness${Z} — orchestration de rôles
+
+  ${B}plan${Z}     Montre qui s'exécutera comment, et pourquoi. N'exécute rien.
+  ${B}run${Z}      Émet les ordres de la prochaine vague, prêts à lancer.
+           ${D}--json${Z} pour une sortie machine · ${D}--all${Z} pour toutes les vagues
+  ${B}layout${Z}   Dispose le terminal pour les rôles en session.
+           ${D}--apply${Z} pour créer réellement · ${D}--session <nom>${Z}
+  ${B}verify${Z}   Évalue les contrats de sortie sur les artefacts présents.
+  ${B}roles${Z}    Liste les rôles chargés et leurs périmètres.
+
+  Le dispositif est lu dans .harness/ du répertoire courant.
+`);
+}
+
+function charger() {
+  const d = chargerDispositif(projet);
+  if (d.erreurs.length) {
+    console.log(`\n${R}Rôles rejetés au chargement :${Z}`);
+    d.erreurs.forEach((e) => console.log(`  ${R}✗${Z} ${e}`));
+    console.log(`${D}  Un rôle mal écrit échoue ici, jamais après avoir consommé des tokens.${Z}`);
+  }
+  if (!d.roles.length) { console.log(`\n${J}Aucun rôle valide dans .harness/roles/${Z}\n`); process.exit(1); }
+  return d;
+}
+
+function plan() {
+  const { disp, roles } = charger();
+  console.log(`\n${B}${disp.name || disp.dispositif}${Z}`);
+  console.log(`${D}${roles.length} rôle(s) — aucune exécution, aucun token consommé${Z}\n`);
+
+  const ordre = vagues(roles);
+  const parNom = new Map(roles.map((r) => [r.role, r]));
+  let sub = 0, ses = 0;
+
+  ordre.forEach((vague, i) => {
+    console.log(`${B}Vague ${i + 1}${Z} ${D}— ${vague.length} rôle(s) en parallèle${Z}`);
+    for (const nom of vague) {
+      const r = parNom.get(nom);
+      const d = decider(r);
+      const couleur = d.mode === 'session' ? J : G;
+      d.mode === 'session' ? ses++ : sub++;
+      const marque = r._auto ? `${J}auto${Z} ` : '';
+      console.log(`  ${couleur}${d.mode.padEnd(8)}${Z} ${nom.padEnd(22)} ${marque}${D}règle ${d.regle} — ${d.pourquoi}${Z}`);
+      if (d.avertissement) console.log(`  ${J}${' '.repeat(8)}${Z} ${' '.repeat(22)} ${J}! ${d.avertissement}${Z}`);
+      const m = r.execution.model || 'standard';
+      const sorties = (r.outputs || []).map((o) => path.relative(projet, o.path)).join(', ') || '—';
+      console.log(`  ${' '.repeat(8)} ${' '.repeat(22)} ${D}modèle ${m} · produit ${sorties}${Z}`);
+    }
+    console.log('');
+  });
+
+  if (roles.some((r) => r._auto)) {
+    console.log(`${D}${J}auto${Z}${D} = posé par harness, sans fichier. La contre-expertise relit les${Z}`);
+    console.log(`${D}       autres rôles et prend position sur chacun. Pour vous en passer :${Z}`);
+    console.log(`${D}       « contre_expertise: false » dans .harness/dispositif.yaml.${Z}\n`);
+  }
+
+  console.log(`${B}Bilan${Z}`);
+  console.log(`  ${G}${sub}${Z} sous-agent(s) ${D}— signal de fin natif, routage de modèle possible${Z}`);
+  console.log(`  ${J}${ses}${Z} session(s)     ${D}— observables, mais pas de routage de modèle${Z}`);
+  const part = roles.length ? Math.round((ses / roles.length) * 100) : 0;
+  if (part > 50) console.log(`\n  ${J}Plus de la moitié en session.${Z} ${D}Des rôles probablement trop larges — relisez leurs scope.writes.${Z}`);
+  console.log('');
+}
+
+
+
+/**
+ * Les questions en attente, affichées avant tout le reste.
+ *
+ * Un rôle bloqué sur une question ressemble, dans la table des contrats, à un
+ * rôle qui a échoué. Les traiter pareil conduirait à relancer un agent qui
+ * attend — et à le voir se rebloquer, indéfiniment.
+ */
+function afficherQuestions() {
+  const qs = lireQuestions(projet);
+  if (!qs.length) return qs;
+  const bloquants = qs.filter((q) => q.bloquant);
+  console.log(`\n${B}${qs.length} question(s) en attente de réponse${Z}`);
+  for (const q of qs) {
+    // Le padding porte sur le mot nu : les codes couleur comptent des
+    // caractères invisibles et fausseraient l'alignement.
+    const mot = q.bloquant ? 'bloquant' : 'avis';
+    const couleur = q.bloquant ? R : J;
+    console.log(`  ${couleur}${mot}${Z}${' '.repeat(10 - mot.length)}${q.role.padEnd(22)} ${D}${q.fichier}${Z}`);
+  }
+  if (bloquants.length) {
+    console.log(`${D}  Un rôle bloquant s'est arrêté volontairement : il n'a pas échoué, il attend.${Z}`);
+    console.log(`${D}  Répondez dans le fichier, puis relancez-le. Si vous n'êtes pas sûr de la${Z}`);
+    console.log(`${D}  réponse, portez la question à l'humain — ne tranchez pas à sa place.${Z}`);
+  }
+  console.log('');
+  return qs;
+}
+
+function run() {
+  const { roles, racine } = charger();
+  const json = process.argv.includes('--json');
+  const tout = process.argv.includes('--all');
+  const j = journal(projet);
+
+  const { prets, faits, bloques, parNom } = prochaineVague(roles);
+  const cible = tout ? roles.filter((r) => !faits.includes(r)) : prets;
+
+  if (!cible.length) {
+    if (json) { console.log(JSON.stringify({ ordres: [], termine: true }, null, 2)); return; }
+    console.log(`\n${G}Tous les contrats sont satisfaits.${Z} ${D}Rien à lancer.${Z}\n`);
+    return;
+  }
+
+  const ordres = cible.map((r) => ordre(r, racine, parNom));
+  ordres.forEach((o) => j.ecrire({ role: o.role, event: 'emitted', mode: o.mode, modele: o.modele }));
+
+  if (json) { console.log(JSON.stringify({ ordres, faits: faits.map((r) => r.role), bloques: bloques.map((r) => r.role) }, null, 2)); return; }
+
+  afficherQuestions();
+  console.log(`${B}${ordres.length} ordre(s) à exécuter${Z}`);
+  if (faits.length)   console.log(`${D}déjà satisfaits : ${faits.map((r) => r.role).join(', ')}${Z}`);
+  if (bloques.length) console.log(`${D}en attente     : ${bloques.map((r) => r.role).join(', ')}${Z}`);
+
+  console.log(`
+${B}Pour l'orchestrateur${Z} ${D}(la session qui lit ceci)${Z}
+  1. Lance un agent par ordre ci-dessous. Ceux marqués ${G}subagent${Z} partent en
+     parallèle ; ceux marqués ${J}session${Z} demandent une fenêtre et ta supervision.
+  2. Donne à chacun ${B}exactement${Z} le texte de son ordre, sans le résumer.
+  3. Respecte le modèle indiqué : c'est le principal levier d'économie.
+  4. Quand ils ont fini : ${B}harness verify${Z}, puis ${B}harness run${Z} pour la vague suivante.`);
+
+  for (const o of ordres) {
+    const c = o.mode === 'session' ? J : G;
+    console.log(`\n${D}${'─'.repeat(70)}${Z}`);
+    console.log(`${c}${o.mode.toUpperCase()}${Z}  ${B}${o.role}${Z} ${D}— ${o.nom}${Z}`);
+    console.log(`${D}modèle ${o.modele} · outils ${o.outils.join(', ')} · règle ${o.regle} (${o.pourquoi})${Z}`);
+    if (o.budget.max_turns) console.log(`${D}budget ${o.budget.max_turns} tours${o.budget.max_tokens ? ', ' + o.budget.max_tokens + ' tokens' : ''}${Z}`);
+    console.log(`${D}produit ${o.produit.join(', ') || '— (réponse directe)'}${Z}`);
+    console.log(`${D}${'─'.repeat(70)}${Z}`);
+    console.log(o.prompt);
+  }
+  console.log('');
+}
+
+
+function layout() {
+  const { roles } = charger();
+  const appliquerVraiment = process.argv.includes('--apply');
+  const iNom = process.argv.indexOf('--session');
+  const nomSession = iNom > 0 ? process.argv[iNom + 1] : 'harness';
+
+  // Seuls les rôles en session occupent l'écran : les sous-agents n'ont rien à montrer.
+  const ordre = vagues(roles);
+  const parNom = new Map(roles.map((r) => [r.role, r]));
+  const parVague = ordre.map((v) => v.filter((n) => decider(parNom.get(n)).mode === 'session'));
+  const disp = calculerDisposition(parVague, nomSession);
+
+  const sousAgents = roles.length - disp.total;
+  console.log(`\n${B}Disposition${Z} ${D}— ${disp.strategie}${Z}`);
+  console.log(`${D}${disp.total} rôle(s) en session · ${sousAgents} sous-agent(s), sans fenêtre${Z}\n`);
+  console.log(dessiner(disp));
+
+  if (!disp.total) { console.log(`\n${D}Les sous-agents rendent leur résultat à l'orchestrateur : rien à superviser à l'écran.${Z}\n`); return; }
+
+  if (!appliquerVraiment) {
+    console.log(`\n${D}Aperçu seulement. Ajoutez ${Z}--apply${D} pour créer la session tmux.${Z}\n`);
+    return;
+  }
+  if (!tmuxPresent()) { console.log(`\n${R}tmux est absent.${Z}\n`); process.exit(1); }
+
+  const { carte, fichier } = appliquer(disp, projet);
+  journal(projet).ecrire({ event: 'layout_applied', session: disp.session, panes: Object.keys(carte).length });
+  console.log(`\n${G}Session « ${disp.session} » créée.${Z}`);
+  for (const [role, id] of Object.entries(carte)) console.log(`  ${role.padEnd(24)} ${D}${id}${Z}`);
+  console.log(`\n${D}Carte écrite dans ${path.relative(projet, fichier)} — les identifiants %N survivent aux réorganisations.${Z}`);
+  console.log(`${D}Pour attacher : ${Z}tmux attach -t ${disp.session}\n`);
+}
+
+function verify() {
+  const { roles } = charger();
+  const qs = afficherQuestions();
+  const bloques = new Set(qs.filter((q) => q.bloquant).map((q) => q.role));
+  if (!qs.length) console.log('');
+  let total = 0, passes = 0;
+  for (const r of roles) {
+    if (!r.outputs.length) continue;
+    const res = verifierRole(r);
+    total++; if (res.ok) passes++;
+    journal(projet).ecrire({ role: r.role, event: res.ok ? 'contract_passed' : 'contract_failed',
+      checks: res.sorties.flatMap((s) => s.checks.filter((c) => !c.ok).map((c) => c.nom)) });
+    const attend = bloques.has(r.role) && !res.ok;
+    console.log(`${res.ok ? G + '✓' : (attend ? J + '⏸' : R + '✗')}${Z} ${B}${r.role}${Z}`
+      + (attend ? ` ${D}— arrêté sur une question, pas en échec${Z}` : ''));
+    for (const s of res.sorties) {
+      console.log(`    ${D}${path.relative(projet, s.path)}${Z}`);
+      for (const c of s.checks) console.log(`      ${c.ok ? G + '✓' : R + '✗'}${Z} ${c.nom.padEnd(34)} ${D}${c.detail}${Z}`);
+      // La question est affichée en clair : sinon l'orchestrateur doit rouvrir
+      // le YAML pour lancer la relecture, et ne la lance donc pas.
+      if (s.review && res.ok) {
+        const q = String(s.review.asks || '').trim().replace(/\s+/g, ' ');
+        console.log(`      ${J}?${Z} review sémantique ${D}— modèle ${s.review.model || 'minimal'}, à lancer :${Z}`);
+        console.log(`        ${D}« ${q} »${Z}`);
+      }
+    }
+  }
+  console.log(`\n${passes}/${total} contrat(s) satisfait(s)\n`);
+  if (passes < total) process.exit(1);
+}
+
+function listerRoles() {
+  const { roles } = charger();
+  console.log('');
+  for (const r of roles) {
+    console.log(`${B}${r.role}${Z} ${D}${r.name || ''}${Z}`);
+    console.log(`  lit    ${D}${(r.scope.reads || []).join(', ') || '—'}${Z}`);
+    console.log(`  écrit  ${D}${(r.scope.writes || []).join(', ') || '—'}${Z}`);
+    const dep = r.depends_on ? (Array.isArray(r.depends_on) ? r.depends_on : [r.depends_on]) : [];
+    if (dep.length) console.log(`  après  ${D}${dep.join(', ')}${Z}`);
+    console.log('');
+  }
+}
+
+const cmd = process.argv[2];
+try {
+  if (cmd === 'plan') plan();
+  else if (cmd === 'run') run();
+  else if (cmd === 'layout') layout();
+  else if (cmd === 'verify') verify();
+  else if (cmd === 'roles') listerRoles();
+  else aide();
+} catch (e) {
+  console.error(`\n${R}${e.message}${Z}\n`);
+  process.exit(1);
+}

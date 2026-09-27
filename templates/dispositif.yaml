@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# Le dispositif : quels rôles, dans quel ordre, avec quelles portes.
+# Ce fichier décrit. Il n'exécute rien et ne contient aucune logique.
+# ---------------------------------------------------------------------------
+dispositif: revue-produit
+name: "Revue globale d'un produit en production"
+
+about: >
+  Faire intervenir plusieurs regards spécialisés sur un produit existant, pour
+  que le développeur arbitre au lieu de tout instruire lui-même.
+
+# Où les rôles écrivent leurs artefacts, si le projet n'a pas de place dédiée.
+artifacts: .harness/artifacts
+
+# Les rôles actifs. L'ordre ici n'a aucune importance : ce sont les
+# `depends_on` de chaque rôle qui déterminent le séquencement.
+roles:
+  - revue-design
+  - revue-business
+  - revue-testabilite
+  - revue-implementation
+  - synthese
+
+# Portes : ce qui doit être vrai pour passer à la suite.
+# Une porte qui échoue arrête ce qui en dépend, pas le reste du dispositif.
+gates:
+  - after: [revue-design, revue-business, revue-testabilite, revue-implementation]
+    requires: outputs_valid        # tous les contrats de sortie satisfaits
+    then: synthese
+
+# Budget global. Atteint, le dispositif s'arrête proprement et le journal dit où.
+budget:
+  max_tokens: 800000
+  timeout: 2h
